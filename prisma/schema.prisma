@@ -1,0 +1,157 @@
+// Schemat bazy dla systemu rezerwacji warsztatowych.
+//
+// UWAGA co do czasu: wszystkie daty i godziny są przechowywane jako "czas ścienny"
+// warsztatu zapisany w polu UTC (bez konwersji stref). Dzięki temu aplikacja
+// zachowuje się identycznie niezależnie od strefy czasowej serwera, a godzina
+// zapisana przez warsztat jest dokładnie tą, którą widzi klient.
+// Cała logika konwersji siedzi w src/lib/time.ts.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Workshop {
+  id           String  @id @default(cuid())
+  slug         String  @unique // adres: /w/<slug>
+  name         String
+  phone        String?
+  address      String?
+  email        String? // tu trafiają powiadomienia o nowych zgłoszeniach
+  passwordHash String
+
+  // Pojemność i reguły kalendarza
+  bays           Int @default(1) // liczba stanowisk obsługiwanych równolegle
+  slotStepMin    Int @default(30) // co ile minut zaczyna się slot
+  leadTimeHours  Int @default(2) // minimalne wyprzedzenie rezerwacji
+  maxAdvanceDays Int @default(60) // jak daleko w przód można rezerwować
+
+  // Abonament — prowadzony ręcznie przez operatora, bez płatności online.
+  // Dozwolone wartości opisuje SubscriptionStatusValue w src/lib/subscription.ts:
+  // TRIAL | ACTIVE | SUSPENDED
+  subscriptionStatus String    @default("TRIAL")
+  subscriptionUntil  DateTime? // koniec okresu próbnego albo opłaconego miesiąca
+  monthlyPricePln    Int       @default(150)
+  adminNote          String? // notatka operatora, niewidoczna dla warsztatu
+
+  // RODO: po ilu miesiącach od wizyty dane klienta są anonimizowane
+  retentionMonths Int @default(24)
+
+  // Przypomnienia przed wizytą
+  remindersEnabled   Boolean @default(true)
+  reminderHoursBefore Int    @default(24) // ile godzin przed wizytą wysłać
+  smsEnabled         Boolean @default(false) // SMS kosztuje, więc domyślnie tylko mail
+
+  createdAt DateTime @default(now())
+
+  services     Service[]
+  workingHours WorkingHours[]
+  timeOff      TimeOff[]
+  bookings     Booking[]
+}
+
+model Service {
+  id          String  @id @default(cuid())
+  workshopId  String
+  name        String
+  description String?
+  durationMin Int // ile realnie zajmuje stanowisko
+  priceFrom   Int? // cena orientacyjna w złotych, opcjonalna
+  active      Boolean @default(true)
+  sortOrder   Int     @default(0)
+
+  workshop Workshop  @relation(fields: [workshopId], references: [id], onDelete: Cascade)
+  bookings Booking[]
+
+  @@index([workshopId])
+}
+
+// Godziny pracy w danym dniu tygodnia. weekday: 0 = poniedziałek ... 6 = niedziela
+model WorkingHours {
+  id         String  @id @default(cuid())
+  workshopId String
+  weekday    Int
+  openMin    Int     @default(480) // 08:00
+  closeMin   Int     @default(1020) // 17:00
+  isClosed   Boolean @default(false)
+
+  workshop Workshop @relation(fields: [workshopId], references: [id], onDelete: Cascade)
+
+  @@unique([workshopId, weekday])
+}
+
+// Blokady w kalendarzu: urlop, inwentaryzacja, dzień świąteczny
+model TimeOff {
+  id         String   @id @default(cuid())
+  workshopId String
+  startAt    DateTime
+  endAt      DateTime
+  reason     String?
+
+  workshop Workshop @relation(fields: [workshopId], references: [id], onDelete: Cascade)
+
+  @@index([workshopId, startAt])
+}
+
+model Booking {
+  id         String @id @default(cuid())
+  workshopId String
+  serviceId  String
+
+  startAt DateTime
+  endAt   DateTime
+
+  // Gdy warsztat proponuje inny termin, oryginalny zapisujemy tutaj
+  originalStartAt DateTime?
+
+  // Status trzymamy jako tekst, a nie enum - SQLite nie ma typu wyliczeniowego,
+  // a dzięki temu ten sam schemat zadziała też po przejściu na Postgresa.
+  // Dozwolone wartości opisuje typ BookingStatusValue w src/lib/status.ts:
+  // PENDING | PROPOSED | CONFIRMED | REJECTED | CANCELLED | DONE
+  status String @default("PENDING")
+
+  // Dane klienta (celowo trzymane na rezerwacji - klient nie zakłada konta)
+  customerName  String
+  customerPhone String
+  customerEmail String?
+  carModel      String
+  carPlate      String?
+  notes         String?
+
+  // Notatka warsztatu widoczna dla klienta (powód odrzucenia, komentarz do terminu)
+  workshopNote String?
+
+  // Skąd wzięła się rezerwacja: ONLINE (klient sam) albo PHONE (wpisana w warsztacie)
+  source String @default("ONLINE")
+
+  // RODO: moment wyrażenia zgody przez klienta i moment anonimizacji danych.
+  // Wizyty wpisane telefonicznie nie mają zgody z formularza — obowiązek
+  // informacyjny spełnia wtedy warsztat przy przyjęciu zgłoszenia.
+  consentAt     DateTime?
+  anonymizedAt  DateTime?
+
+  // Skrót adresu IP zgłaszającego (HMAC, nie da się z niego odtworzyć adresu).
+  // Służy wyłącznie do limitowania spamu.
+  ipHash String?
+
+  // Moment wysłania przypomnienia — pilnuje, żeby nie wyszło dwa razy
+  reminderSentAt DateTime?
+
+  // Token do zarządzania rezerwacją bez logowania (link w mailu)
+  manageToken String @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workshop Workshop @relation(fields: [workshopId], references: [id], onDelete: Cascade)
+  service  Service  @relation(fields: [serviceId], references: [id])
+
+  @@index([workshopId, startAt])
+  @@index([workshopId, status])
+  @@index([customerPhone])
+  @@index([ipHash, createdAt])
+}
